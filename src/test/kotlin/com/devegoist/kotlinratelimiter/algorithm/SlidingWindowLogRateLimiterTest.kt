@@ -9,16 +9,16 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
-@DisplayName("FixedWindowRateLimiter")
-class FixedWindowRateLimiterTest {
+@DisplayName("SlidingWindowLogRateLimiter")
+class SlidingWindowLogRateLimiterTest {
 
     @Nested
     @DisplayName("기본 동작")
     inner class BasicBehavior {
 
         @Test
-        fun `윈도우당 limit만큼 요청이 허용된다`() {
-            val limiter = FixedWindowRateLimiter(limit = 5, windowSizeMillis = 10_000)
+        fun `윈도우 안에서 limit만큼 요청이 허용된다`() {
+            val limiter = SlidingWindowLogRateLimiter(limit = 5, windowSizeMillis = 10_000)
 
             repeat(5) { i ->
                 assertThat(limiter.tryAcquire("c"))
@@ -30,50 +30,65 @@ class FixedWindowRateLimiterTest {
     }
 
     @Nested
-    @DisplayName("윈도우 전환")
-    inner class WindowRotation {
+    @DisplayName("윈도우 슬라이딩")
+    inner class Sliding {
 
         @Test
-        fun `윈도우가 바뀌면 카운터가 리셋된다`() {
-            val limiter = FixedWindowRateLimiter(limit = 3, windowSizeMillis = 200)
+        fun `오래된 요청이 윈도우를 벗어나면 자리가 생긴다`() {
+            val limiter = SlidingWindowLogRateLimiter(limit = 3, windowSizeMillis = 300)
 
             repeat(3) { limiter.tryAcquire("c") }
             assertThat(limiter.tryAcquire("c")).isFalse()
 
-            // 다음 윈도우로 확실히 넘어가도록 대기
-            Thread.sleep(250)
+            // 윈도우가 지나가면 모든 기록이 만료됨
+            Thread.sleep(350)
 
             assertThat(limiter.tryAcquire("c")).isTrue()
+        }
+
+        @Test
+        fun `요청이 하나씩 만료되면 하나씩 통과한다`() {
+            val limiter = SlidingWindowLogRateLimiter(limit = 2, windowSizeMillis = 400)
+
+            // t=0: 2개 소진
+            assertThat(limiter.tryAcquire("c")).isTrue()
+            Thread.sleep(200)
+            // t=200: 두 번째
+            assertThat(limiter.tryAcquire("c")).isTrue()
+            assertThat(limiter.tryAcquire("c")).isFalse()
+
+            // t=450: 첫 번째(t=0)만 만료 → 자리 하나
+            Thread.sleep(250)
+            assertThat(limiter.tryAcquire("c")).isTrue()
+            // 두 번째(t=200)는 아직 유효 → 다시 꽉 참
+            assertThat(limiter.tryAcquire("c")).isFalse()
         }
     }
 
     @Nested
-    @DisplayName("경계 문제 (알려진 약점)")
-    inner class BoundarySpike {
+    @DisplayName("Fixed Window와의 차이 — 경계 문제 없음")
+    inner class NoBoundarySpike {
 
         @Test
-        fun `윈도우 경계에서는 limit의 2배까지 통과할 수 있다`() {
+        fun `윈도우 경계를 걸쳐도 limit을 초과하지 않는다`() {
             val windowSize = 500L
-            val limiter = FixedWindowRateLimiter(limit = 5, windowSizeMillis = windowSize)
+            val limit = 5
+            val limiter = SlidingWindowLogRateLimiter(limit = limit, windowSizeMillis = windowSize)
 
-            // 현재 윈도우가 끝나기 직전까지 대기
+            // Fixed Window라면 2배가 통과했을 시나리오를 재현
             val now = System.currentTimeMillis()
             val untilBoundary = windowSize - (now % windowSize)
-            Thread.sleep(untilBoundary - 50)   // 경계 50ms 전
+            Thread.sleep(untilBoundary - 50)
 
-            // 윈도우 끝자락에서 5개 소진
-            val beforeBoundary = (1..5).count { limiter.tryAcquire("c") }
-            assertThat(beforeBoundary).isEqualTo(5)
+            val before = (1..5).count { limiter.tryAcquire("c") }
+            assertThat(before).isEqualTo(5)
 
-            // 경계를 넘김
-            Thread.sleep(60)
+            Thread.sleep(60)   // 시계 기준 윈도우 경계를 넘김
 
-            // 새 윈도우라 또 5개 통과
-            val afterBoundary = (1..5).count { limiter.tryAcquire("c") }
-            assertThat(afterBoundary).isEqualTo(5)
-
-            // 결과: 약 110ms 사이에 10개 통과 (제한은 500ms당 5개)
-            assertThat(beforeBoundary + afterBoundary).isEqualTo(10)
+            // Fixed Window는 여기서 5개가 더 통과했지만,
+            // Sliding Window Log는 이전 요청들이 아직 윈도우 안에 있으므로 거부
+            val after = (1..5).count { limiter.tryAcquire("c") }
+            assertThat(after).isEqualTo(0)
         }
     }
 
@@ -82,8 +97,8 @@ class FixedWindowRateLimiterTest {
     inner class ClientIsolation {
 
         @Test
-        fun `서로 다른 클라이언트는 독립적인 카운터를 가진다`() {
-            val limiter = FixedWindowRateLimiter(limit = 2, windowSizeMillis = 10_000)
+        fun `서로 다른 클라이언트는 독립적인 로그를 가진다`() {
+            val limiter = SlidingWindowLogRateLimiter(limit = 2, windowSizeMillis = 10_000)
 
             repeat(2) { limiter.tryAcquire("alice") }
             assertThat(limiter.tryAcquire("alice")).isFalse()
@@ -100,8 +115,8 @@ class FixedWindowRateLimiterTest {
 
         @Test
         fun `동시 접근 시 정확히 limit만큼만 허용된다`() {
-            val limit = 100L
-            val limiter = FixedWindowRateLimiter(limit = limit, windowSizeMillis = 60_000)
+            val limit = 100
+            val limiter = SlidingWindowLogRateLimiter(limit = limit, windowSizeMillis = 60_000)
 
             val threads = 50
             val executor = Executors.newFixedThreadPool(threads)
@@ -123,7 +138,7 @@ class FixedWindowRateLimiterTest {
             latch.await()
             executor.shutdown()
 
-            assertThat(allowed.get()).isEqualTo(limit.toInt())
+            assertThat(allowed.get()).isEqualTo(limit)
         }
     }
 
@@ -133,13 +148,13 @@ class FixedWindowRateLimiterTest {
 
         @Test
         fun `limit이 0 이하이면 예외를 던진다`() {
-            assertThatThrownBy { FixedWindowRateLimiter(limit = 0, windowSizeMillis = 1000) }
+            assertThatThrownBy { SlidingWindowLogRateLimiter(limit = 0, windowSizeMillis = 1000) }
                 .isInstanceOf(IllegalArgumentException::class.java)
         }
 
         @Test
         fun `windowSizeMillis가 0 이하이면 예외를 던진다`() {
-            assertThatThrownBy { FixedWindowRateLimiter(limit = 10, windowSizeMillis = 0) }
+            assertThatThrownBy { SlidingWindowLogRateLimiter(limit = 10, windowSizeMillis = 0) }
                 .isInstanceOf(IllegalArgumentException::class.java)
         }
     }

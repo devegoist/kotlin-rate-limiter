@@ -1,4 +1,4 @@
-package com.example.ratelimiter.algorithm
+package com.devegoist.kotlinratelimiter.algorithm
 
 import com.devegoist.kotlinratelimiter.core.RateLimiter
 import java.util.concurrent.ConcurrentHashMap
